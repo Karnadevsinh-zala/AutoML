@@ -1,0 +1,4 @@
+autoviz
+pandas
+ipython
+setuptools

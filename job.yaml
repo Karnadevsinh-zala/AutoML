@@ -1,0 +1,14 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlc
+spec:
+  template:
+    spec:
+      containers:
+      - name: vlc
+        image: karnadevsinh9/dan:v1
+        imagePullPolicy: Always
+        command: ["python", "DataAnalysis.py"]
+      restartPolicy: Never
+  backoffLimit: 4
