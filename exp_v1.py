@@ -477,7 +477,6 @@ async def apply_dimensionality_reduction(file_id: str, target_column: str = '', 
         if len(numerical_cols) < 2:
             return JSONResponse(content={"message": "Dimensionality reduction not applicable: Not enough numerical columns."})
 
-        # Scale the data excluding the target column
         scaler = StandardScaler()
         scaled_data = scaler.fit_transform(df[numerical_cols])
 

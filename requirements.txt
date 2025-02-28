@@ -2,3 +2,15 @@ autoviz
 pandas
 ipython
 setuptools
+fastapi
+uvicorn
+numpy
+scikit-learn
+optuna
+statsmodels
+matplotlib
+seaborn
+streamlit
+onnxconverter-common
+skl2onnx
+requests
