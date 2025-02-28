@@ -1,10 +1,15 @@
 import base64
-
+import os
+import uuid
 import optuna
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
+
+from onnxconverter_common import FloatTensorType
+from skl2onnx import convert_sklearn
+
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
@@ -13,43 +18,67 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.tree import DecisionTreeClassifier
-import io
-import seaborn as sns
 from sklearn.svm import SVC
+from sklearn.decomposition import PCA
+
+import seaborn as sns
+
 from starlette.responses import JSONResponse
 from io import BytesIO
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from sklearn.decomposition import PCA
+import logging
 
 app = FastAPI()
 
+DATA_DIR = "data"
 
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def get_file_path(file_id: str) -> str:
+    return os.path.join(DATA_DIR, f"{file_id}.csv")
 
 @app.post("/upload-file/")
 async def upload_file(file: UploadFile = File(...)):
     try:
+        file_id = str(uuid.uuid4())
+        logging.info(f"File uploaded with ID: {file_id}")
+        file_path = get_file_path(file_id)
+
         data = pd.read_csv(file.file)
-        return {"columns": data.columns.tolist(), "message": "File uploaded successfully."}
+        cleaned_data = data.dropna()
+        cleaned_data.to_csv(file_path, index=False)
+
+        return {"file_id": file_id, "columns": data.columns.tolist(), "message": "File uploaded successfully."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to upload file: {e}")
 
 
 @app.post("/dataset-info/")
-async def dataset_info(file: UploadFile = File(...)):
+async def dataset_info(file_id: str):
     try:
-        data = pd.read_csv(file.file)
-        buffer = io.StringIO()
-        data.info(buf=buffer)
-        return {"info": buffer.getvalue()}
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+        data_sample = data.to_dict(orient='records')
+        return {"data": data_sample}
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to get dataset info: {e}")
 
 
 @app.post("/stat-analysis/")
-async def stat_analysis(file: UploadFile = File(...)):
+async def stat_analysis(file_id: str):
     try:
-        data = pd.read_csv(file.file)
-        description = data.describe(include='all').T.to_dict()
+        file_path = get_file_path(file_id)
+        logging.info(f"Performing statistical analysis on file ID: {file_id}")
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+        description = data.describe(include='all').T
+
+        description = description.replace([float('inf'), float('-inf'), float('nan')], None)
+        description = description.to_dict()
 
         column_names = []
         data_types = []
@@ -112,33 +141,39 @@ async def stat_analysis(file: UploadFile = File(...)):
 
 
 @app.post("/correlation-matrix/")
-async def correlation_matrix(file: UploadFile = File(...)):
+async def correlation_matrix(file_id: str):
     try:
-        # Read the uploaded file into a DataFrame
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            logging.error(f"File not found for file ID: {file_id}")
+            raise HTTPException(status_code=404, detail="File not found.")
 
-        # Convert non-numeric columns to numeric, coercing errors to NaN
-        num_data = data.copy()
-        for column in num_data.select_dtypes(include=['object']).columns:
-            num_data[column] = pd.to_numeric(num_data[column], errors='coerce')
+        data = pd.read_csv(file_path)
+        logging.info(f"Data loaded successfully for file ID: {file_id}")
 
-        # Compute the correlation matrix
+        num_data = data.select_dtypes(include=[float, int])
+
+        if num_data.empty:
+            logging.error("No numeric data available for correlation matrix.")
+            raise HTTPException(status_code=400, detail="No numeric data available for correlation matrix.")
+
         cor_matrix = num_data.corr()
 
-        # Prepare results with top 3 correlated columns for each column
+        cor_matrix = cor_matrix.replace({float('nan'): None})
+
         results = pd.DataFrame(
             columns=['Column', 'Top Correlated Column 1', 'Top Correlated Column 2', 'Top Correlated Column 3']
         )
 
         k = 3
         for column in cor_matrix.columns:
-            top_k = cor_matrix[column].nlargest(k + 1).iloc[1:]  # Exclude the column itself
+            top_k = cor_matrix[column].dropna().nlargest(k + 1).iloc[1:]  # Exclude the column itself
 
             results = pd.concat([results, pd.DataFrame({
                 'Column': [column],
-                'Top Correlated Column 1': [f"{top_k.index[0]}: {top_k.iloc[0]:.2f}"],
-                'Top Correlated Column 2': [f"{top_k.index[1]}: {top_k.iloc[1]:.2f}"],
-                'Top Correlated Column 3': [f"{top_k.index[2]}: {top_k.iloc[2]:.2f}"]
+                'Top Correlated Column 1': [f"{top_k.index[0]}: {top_k.iloc[0]:.2f}"] if len(top_k) > 0 else [None],
+                'Top Correlated Column 2': [f"{top_k.index[1]}: {top_k.iloc[1]:.2f}"] if len(top_k) > 1 else [None],
+                'Top Correlated Column 3': [f"{top_k.index[2]}: {top_k.iloc[2]:.2f}"] if len(top_k) > 2 else [None]
             })], ignore_index=True)
 
         return {
@@ -147,13 +182,17 @@ async def correlation_matrix(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        logging.error(f"Failed to compute correlation matrix: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to compute correlation matrix: {e}")
 
 
 @app.post("/high-covariance-features/")
-async def high_covariance_features(file: UploadFile = File(...), vif_threshold: float = 10, corr_threshold: float = 0.8):
+async def high_covariance_features(file_id: str, vif_threshold: float = 10, corr_threshold: float = 0.8):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
         core_num = data.select_dtypes(include=[np.number]).dropna(axis='columns')
         vif_data = pd.DataFrame()
         vif_data['Feature'] = core_num.columns
@@ -172,9 +211,12 @@ async def high_covariance_features(file: UploadFile = File(...), vif_threshold: 
         raise HTTPException(status_code=400, detail=f"Failed to identify high covariance features: {e}")
 
 @app.post("/feature-importance/")
-async def feature_importance(target_variable, file: UploadFile = File(...)):
+async def feature_importance(target_variable, file_id):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
         df = data.copy()
         label_encoders = {}
         for column in df.select_dtypes(include=['object']).columns:
@@ -182,6 +224,7 @@ async def feature_importance(target_variable, file: UploadFile = File(...)):
             df[column] = label_encoders[column].fit_transform(df[column])
 
         cor_matrix = df.corr()
+        cor_matrix = cor_matrix.replace({float('nan'): None})
         feature_imp = cor_matrix[target_variable].drop(target_variable).abs().sort_values(ascending=False)
 
         imp_df = pd.DataFrame({
@@ -231,7 +274,6 @@ async def select_best_group(data, target_variable, top_k=3):
     grouped_features = await group_features(target_variable, data)
     performance_results = evaluate_group_performance(data, target_variable, grouped_features)
 
-    # Sort the results by accuracy in descending order and select the top k groups
     sorted_results = sorted(performance_results.items(), key=lambda x: x[1][1], reverse=True)[:top_k]
 
     best_groups = [{"Threshold": threshold, "Features": groups, "Accuracy": accuracy}
@@ -241,8 +283,12 @@ async def select_best_group(data, target_variable, top_k=3):
     return best_groups_df
 
 @app.post("/group-features/")
-async def group_features(target_variable: str, file: UploadFile = File(...)):
-    data = pd.read_csv(file.file)
+async def group_features(target_variable: str, file_id):
+    file_path = get_file_path(file_id)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    data = pd.read_csv(file_path)
+
     df = data.copy()
     label_encoders = {}
     for column in df.select_dtypes(include=['object']).columns:
@@ -258,8 +304,6 @@ async def group_features(target_variable: str, file: UploadFile = File(...)):
         grouped_features[str(threshold)] = groups
 
 
-
-    # evaluate group performance
     results = {}
 
     if data[target_variable].dtype == 'object':
@@ -296,11 +340,12 @@ async def group_features(target_variable: str, file: UploadFile = File(...)):
                        for threshold, (groups, accuracy) in sorted_results]
 
         best_groups_df = pd.DataFrame(best_groups)
+
     return best_groups_df
 
 
 def determine_bins_for_column(data):
-    #Freedman-Diaconis rule
+    #Freedman-Diaconis rule --> for optimal bins selection
     data = data.dropna()
     n = len(data)
     if n == 0:
@@ -314,9 +359,13 @@ def determine_bins_for_column(data):
         return 1
 
 @app.post("/bin-numerical-columns/")
-async def bin_numerical_columns_with_visualization(file: UploadFile = File(...)):
+async def bin_numerical_columns_with_visualization(file_id):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+
         df = data.copy()
         visualizations = {}
 
@@ -351,6 +400,7 @@ async def bin_numerical_columns_with_visualization(file: UploadFile = File(...))
                 image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
                 visualizations[column] = image_base64
 
+        data.to_csv(file_path, index=False)
         return JSONResponse(content=visualizations)
 
     except Exception as e:
@@ -358,9 +408,13 @@ async def bin_numerical_columns_with_visualization(file: UploadFile = File(...))
 
 
 @app.post("/sample-numerical-columns/")
-async def sample_numerical_columns(file: UploadFile = File(...), sample_fraction: float = 0.1):
+async def sample_numerical_columns(file_id: str, sample_fraction: float = 0.1):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+
         df = data.copy()
         sampled_df = pd.DataFrame()
         visualizations = {}
@@ -397,6 +451,7 @@ async def sample_numerical_columns(file: UploadFile = File(...), sample_fraction
                 no_sampling_required.append(column)
                 sampled_df[column] = df[column]
 
+        data.to_csv(file_path, index=False)
         return JSONResponse(content={"visualizations": visualizations, "no_sampling_required": no_sampling_required})
 
     except Exception as e:
@@ -404,9 +459,13 @@ async def sample_numerical_columns(file: UploadFile = File(...), sample_fraction
 
 
 @app.post("/apply-dimensionality-reduction/")
-async def apply_dimensionality_reduction(file: UploadFile = File(...), target_column: str = '', explained_variance_threshold: float = 0.95):
+async def apply_dimensionality_reduction(file_id: str, target_column: str = '', explained_variance_threshold: float = 0.95):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+
         df = data.copy()
 
         numerical_cols = df.select_dtypes(include=[np.number]).columns
@@ -435,7 +494,6 @@ async def apply_dimensionality_reduction(file: UploadFile = File(...), target_co
         reduced_data = pca.transform(scaled_data)[:, :num_components]
         reduced_df = pd.DataFrame(reduced_data, columns=[f'PC{i + 1}' for i in range(num_components)])
 
-        # Visualization
         fig, ax = plt.subplots()
         ax.plot(range(1, len(cumulative_variance) + 1), cumulative_variance, marker='o')
         ax.axhline(y=explained_variance_threshold, color='r', linestyle='--')
@@ -448,6 +506,7 @@ async def apply_dimensionality_reduction(file: UploadFile = File(...), target_co
         plt.close(fig)
         cumulative_variance_image = base64.b64encode(buf.getvalue()).decode('utf-8')
 
+        data.to_csv(file_path, index=False)
         return JSONResponse(content={
             "message": f"Reduced dimensions from {len(numerical_cols)} to {num_components} to retain {explained_variance_threshold * 100}% variance.",
             "explained_variance": pca.explained_variance_ratio_[:num_components].tolist(),
@@ -483,7 +542,7 @@ def preprocess_data(data, target_variable):
 
 def objective(trial, X_train, y_train, model_name):
     if model_name == "Logistic Regression":
-        C = trial.suggest_loguniform("C", 1e-3, 1e3)
+        C = trial.suggest_float("C", 1e-3, 1e3, log=True)
         model = LogisticRegression(C=C, max_iter=1000)
 
     elif model_name == "Decision Tree":
@@ -498,12 +557,12 @@ def objective(trial, X_train, y_train, model_name):
 
     elif model_name == "Gradient Boosting":
         n_estimators = trial.suggest_int("n_estimators", 10, 200)
-        learning_rate = trial.suggest_loguniform("learning_rate", 1e-3, 0.1)
+        learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.1, log=True)
         max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
         model = GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth)
 
     elif model_name == "SVM":
-        C = trial.suggest_loguniform("C", 1e-3, 1e3)
+        C = trial.suggest_float("C", 1e-3, 1e3, log=True)
         kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
         model = SVC(C=C, kernel=kernel, probability=True)
 
@@ -516,9 +575,13 @@ def objective(trial, X_train, y_train, model_name):
 
 
 @app.post("/train-and-compare-models/")
-async def train_and_compare_models(file: UploadFile = File(...), target_variable: str = ''):
+async def train_and_compare_models(file_id: str, target_variable: str = ''):
     try:
-        data = pd.read_csv(file.file)
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+        data = pd.read_csv(file_path)
+
         X_transformed, y_encoded, _ = preprocess_data(data, target_variable)
 
         X_train, X_test, y_train, y_test = train_test_split(X_transformed, y_encoded, test_size=0.3, random_state=42)
@@ -528,26 +591,27 @@ async def train_and_compare_models(file: UploadFile = File(...), target_variable
         best_model = None
         best_model_name = ""
         best_accuracy = 0.0
+        best_params = {}
 
         for model_name in models:
             study = optuna.create_study(direction="maximize")
             study.optimize(lambda trial: objective(trial, X_train, y_train, model_name), n_trials=50)
 
             best_trial = study.best_trial
-            best_params = best_trial.params
+            current_params = best_trial.params
 
             if model_name == "Logistic Regression":
-                model = LogisticRegression(**best_params, max_iter=1000)
+                model = LogisticRegression(**current_params, max_iter=1000)
             elif model_name == "Decision Tree":
-                model = DecisionTreeClassifier(**best_params)
+                model = DecisionTreeClassifier(**current_params)
             elif model_name == "Random Forest":
-                model = RandomForestClassifier(**best_params)
+                model = RandomForestClassifier(**current_params)
             elif model_name == "Gradient Boosting":
-                model = GradientBoostingClassifier(**best_params)
+                model = GradientBoostingClassifier(**current_params)
             elif model_name == "SVM":
-                model = SVC(**best_params, probability=True)
+                model = SVC(**current_params, probability=True)
             elif model_name == "KNN":
-                model = KNeighborsClassifier(**best_params)
+                model = KNeighborsClassifier(**current_params)
 
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
@@ -561,13 +625,27 @@ async def train_and_compare_models(file: UploadFile = File(...), target_variable
                 "F1 Score": f1_score(y_test, y_pred, average='weighted')
             }
 
-            # Check for the best model
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 best_model = model
                 best_model_name = model_name
+                best_params = current_params
 
-        return JSONResponse(content={"best_metrics": best_metrics, "best_model_name": best_model_name})
+            if best_model is not None:
+                best_model_dir = "best_model"
+                os.makedirs(best_model_dir, exist_ok=True)
+
+                initial_type = [('float_input', FloatTensorType([None, X_train.shape[1]]))]
+                onnx_model = convert_sklearn(best_model, initial_types=initial_type)
+                onnx_file_path = os.path.join(best_model_dir, f"best_model_{best_model_name}.onnx")
+                with open(onnx_file_path, "wb") as f:
+                    f.write(onnx_model.SerializeToString())
+
+        return JSONResponse(content={
+            "best_metrics": best_metrics,
+            "best_model_name": best_model_name,
+            "best_params": best_params
+        })
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to train and compare models: {e}")
