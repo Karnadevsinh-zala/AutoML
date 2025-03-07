@@ -23,12 +23,17 @@ from sklearn.decomposition import PCA
 
 import seaborn as sns
 
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from io import BytesIO
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 import logging
 
+from pydantic import BaseModel
+
 app = FastAPI()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DATA_DIR = "data"
 
@@ -53,6 +58,19 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to upload file: {e}")
 
 
+@app.get("/get-file/")
+async def get_file(file_id: str):
+    try:
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+
+        # Return the file as a streaming response
+        return StreamingResponse(open(file_path, "rb"), media_type="text/csv")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to retrieve file: {e}")
+
+
 @app.post("/dataset-info/")
 async def dataset_info(file_id: str):
     try:
@@ -65,6 +83,28 @@ async def dataset_info(file_id: str):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to get dataset info: {e}")
+
+
+@app.post("/split-dataset/")
+async def split_dataset(file_id: str, test_size: float = 0.3):
+    try:
+        file_path = get_file_path(file_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+
+        data = pd.read_csv(file_path)
+        train_data, test_data = train_test_split(data, test_size=test_size, random_state=42)
+
+        train_file_path = os.path.join(DATA_DIR, f"{file_id}_train.csv")
+        test_file_path = os.path.join(DATA_DIR, f"{file_id}_test.csv")
+
+        train_data.to_csv(train_file_path, index=False)
+        test_data.to_csv(test_file_path, index=False)
+
+        return {"train_file_id": f"{file_id}_train", "test_file_id": f"{file_id}_test",
+                "message": "Dataset split successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to split dataset: {e}")
 
 
 @app.post("/stat-analysis/")
@@ -517,87 +557,117 @@ async def apply_dimensionality_reduction(file_id: str, target_column: str = '', 
 
 
 
-def preprocess_data(data, target_variable):
-    X = data.drop(columns=[target_variable])
-    y = data[target_variable]
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
 
+def create_preprocessor(X):
     categorical_cols = X.select_dtypes(include=['object', 'category']).columns
+    numerical_cols = X.select_dtypes(include=['number']).columns
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ('num', StandardScaler(), X.select_dtypes(include=['number']).columns),
+            ('num', StandardScaler(), numerical_cols),
             ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)
         ],
         remainder='passthrough'
     )
 
-    X_transformed = preprocessor.fit_transform(X)
+    return preprocessor
 
-    label_encoder = LabelEncoder()
-    y_encoded = label_encoder.fit_transform(y)
-
-    return X_transformed, y_encoded, label_encoder
-
+def preprocess_data(preprocessor, X):
+    try:
+        X_transformed = preprocessor.transform(X)
+        return X_transformed
+    except Exception as e:
+        logger.error(f"Error during transformation: {e}")
+        raise ValueError(f"Error during transformation: {e}")
 
 def objective(trial, X_train, y_train, model_name):
-    if model_name == "Logistic Regression":
-        C = trial.suggest_float("C", 1e-3, 1e3, log=True)
-        model = LogisticRegression(C=C, max_iter=1000)
+    try:
+        if model_name == "Logistic Regression":
+            C = trial.suggest_float("C", 1e-3, 1e3, log=True)
+            model = LogisticRegression(C=C, max_iter=1000)
 
-    elif model_name == "Decision Tree":
-        max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
-        min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
-        model = DecisionTreeClassifier(max_depth=max_depth, min_samples_split=min_samples_split)
+        elif model_name == "Decision Tree":
+            max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
+            min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+            model = DecisionTreeClassifier(max_depth=max_depth, min_samples_split=min_samples_split)
 
-    elif model_name == "Random Forest":
-        n_estimators = trial.suggest_int("n_estimators", 10, 200)
-        max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
-        model = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth)
+        elif model_name == "Random Forest":
+            n_estimators = trial.suggest_int("n_estimators", 10, 200)
+            max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
+            model = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth)
 
-    elif model_name == "Gradient Boosting":
-        n_estimators = trial.suggest_int("n_estimators", 10, 200)
-        learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.1, log=True)
-        max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
-        model = GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth)
+        elif model_name == "Gradient Boosting":
+            n_estimators = trial.suggest_int("n_estimators", 10, 200)
+            learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.1, log=True)
+            max_depth = trial.suggest_int("max_depth", 2, 32, log=True)
+            model = GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth)
 
-    elif model_name == "SVM":
-        C = trial.suggest_float("C", 1e-3, 1e3, log=True)
-        kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
-        model = SVC(C=C, kernel=kernel, probability=True)
+        elif model_name == "SVM":
+            C = trial.suggest_float("C", 1e-3, 1e3, log=True)
+            kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
+            model = SVC(C=C, kernel=kernel, probability=True)
 
-    elif model_name == "KNN":
-        n_neighbors = trial.suggest_int("n_neighbors", 1, 20)
-        model = KNeighborsClassifier(n_neighbors=n_neighbors)
+        elif model_name == "KNN":
+            n_neighbors = trial.suggest_int("n_neighbors", 1, 20)
+            model = KNeighborsClassifier(n_neighbors=n_neighbors)
 
-    model.fit(X_train, y_train)
-    return accuracy_score(y_train, model.predict(X_train))
-
+        model.fit(X_train, y_train)
+        return accuracy_score(y_train, model.predict(X_train))
+    except Exception as e:
+        logger.error(f"Error during model training: {e}")
+        raise ValueError(f"Error during model training: {e}")
 
 @app.post("/train-and-compare-models/")
-async def train_and_compare_models(file_id: str, target_variable: str = ''):
+async def train_and_compare_models(train_file_id: str, test_file_id: str, target_variable: str = ''):
     try:
-        file_path = get_file_path(file_id)
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="File not found.")
-        data = pd.read_csv(file_path)
+        train_file_path = get_file_path(train_file_id)
+        test_file_path = get_file_path(test_file_id)
 
-        X_transformed, y_encoded, _ = preprocess_data(data, target_variable)
+        if not os.path.exists(train_file_path) or not os.path.exists(test_file_path):
+            raise HTTPException(status_code=404, detail="Train or test file not found.")
 
-        X_train, X_test, y_train, y_test = train_test_split(X_transformed, y_encoded, test_size=0.3, random_state=42)
+        train_data = pd.read_csv(train_file_path)
+        test_data = pd.read_csv(test_file_path)
+
+        X_train = train_data.drop(columns=[target_variable])
+        y_train = train_data[target_variable]
+
+        X_test = test_data.drop(columns=[target_variable])
+        y_test = test_data[target_variable]
+
+        # Create preprocessor using training data
+        preprocessor = create_preprocessor(X_train)
+        X_train_transformed = preprocessor.fit_transform(X_train)
+
+        # Use the same preprocessor for test data
+        X_test_transformed = preprocess_data(preprocessor, X_test)
+
+        # Encode target variable
+        label_encoder = LabelEncoder()
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        y_test_encoded = label_encoder.transform(y_test)
 
         models = ["Logistic Regression", "Decision Tree", "Random Forest", "Gradient Boosting", "SVM", "KNN"]
         best_metrics = {model_name: {} for model_name in models}
+        model_params = {model_name: {} for model_name in models}  # To store hyperparameters for each model
         best_model = None
         best_model_name = ""
         best_accuracy = 0.0
         best_params = {}
 
         for model_name in models:
+            logger.info(f"Optimizing model: {model_name}")
             study = optuna.create_study(direction="maximize")
-            study.optimize(lambda trial: objective(trial, X_train, y_train, model_name), n_trials=50)
+            study.optimize(lambda trial: objective(trial, X_train_transformed, y_train_encoded, model_name),
+                           n_trials=50)
 
             best_trial = study.best_trial
             current_params = best_trial.params
+            model_params[model_name] = current_params  # Store hyperparameters
+            logger.info(f"Best parameters for {model_name}: {current_params}")
 
             if model_name == "Logistic Regression":
                 model = LogisticRegression(**current_params, max_iter=1000)
@@ -612,16 +682,15 @@ async def train_and_compare_models(file_id: str, target_variable: str = ''):
             elif model_name == "KNN":
                 model = KNeighborsClassifier(**current_params)
 
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
+            model.fit(X_train_transformed, y_train_encoded)
+            y_pred = model.predict(X_test_transformed)
 
-            # Collect metrics
-            accuracy = accuracy_score(y_test, y_pred)
+            accuracy = accuracy_score(y_test_encoded, y_pred)
             best_metrics[model_name] = {
                 "Accuracy": accuracy,
-                "Precision": precision_score(y_test, y_pred, average='weighted'),
-                "Recall": recall_score(y_test, y_pred, average='weighted'),
-                "F1 Score": f1_score(y_test, y_pred, average='weighted')
+                "Precision": precision_score(y_test_encoded, y_pred, average='weighted'),
+                "Recall": recall_score(y_test_encoded, y_pred, average='weighted'),
+                "F1 Score": f1_score(y_test_encoded, y_pred, average='weighted')
             }
 
             if accuracy > best_accuracy:
@@ -630,21 +699,103 @@ async def train_and_compare_models(file_id: str, target_variable: str = ''):
                 best_model_name = model_name
                 best_params = current_params
 
-            if best_model is not None:
-                best_model_dir = "best_model"
-                os.makedirs(best_model_dir, exist_ok=True)
+        if best_model is not None:
+            best_model_dir = "best_model"
+            os.makedirs(best_model_dir, exist_ok=True)
 
-                initial_type = [('float_input', FloatTensorType([None, X_train.shape[1]]))]
-                onnx_model = convert_sklearn(best_model, initial_types=initial_type)
-                onnx_file_path = os.path.join(best_model_dir, f"best_model_{best_model_name}.onnx")
-                with open(onnx_file_path, "wb") as f:
-                    f.write(onnx_model.SerializeToString())
+            initial_type = [('float_input', FloatTensorType([None, X_train_transformed.shape[1]]))]
+            onnx_model = convert_sklearn(best_model, initial_types=initial_type)
+            onnx_file_path = os.path.join(best_model_dir, f"best_model_{best_model_name}.onnx")
+            with open(onnx_file_path, "wb") as f:
+                f.write(onnx_model.SerializeToString())
 
         return JSONResponse(content={
             "best_metrics": best_metrics,
             "best_model_name": best_model_name,
-            "best_params": best_params
+            "best_params": best_params,
+            "model_params": model_params  # Include all models' hyperparameters
         })
 
     except Exception as e:
+        logger.error(f"Failed to train and compare models: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to train and compare models: {e}")
+
+
+class RetrainRequest(BaseModel):
+    hyperparameters: dict
+    train_file_id: str
+    test_file_id: str
+    target_variable: str
+
+@app.post("/retrain-models/")
+async def retrain_models(request: RetrainRequest):
+    try:
+        # Load and preprocess data as before...
+
+        train_file_path = get_file_path(request.train_file_id)
+        test_file_path = get_file_path(request.test_file_id)
+
+        if not os.path.exists(train_file_path) or not os.path.exists(test_file_path):
+            raise HTTPException(status_code=404, detail="Train or test file not found.")
+
+        train_data = pd.read_csv(train_file_path)
+        test_data = pd.read_csv(test_file_path)
+
+        X_train = train_data.drop(columns=[request.target_variable])
+        y_train = train_data[request.target_variable]
+
+        X_test = test_data.drop(columns=[request.target_variable])
+        y_test = test_data[request.target_variable]
+
+        preprocessor = create_preprocessor(X_train)
+        X_train_transformed = preprocessor.fit_transform(X_train)
+        X_test_transformed = preprocess_data(preprocessor, X_test)
+
+        label_encoder = LabelEncoder()
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        y_test_encoded = label_encoder.transform(y_test)
+
+        best_model = None
+        best_model_name = ""
+        best_accuracy = 0.0
+
+        best_metrics = {}
+        for model_name, params in request.hyperparameters.items():
+            if model_name == "Logistic Regression":
+                model = LogisticRegression(**params, max_iter=1000)
+            elif model_name == "Decision Tree":
+                model = DecisionTreeClassifier(**params)
+            elif model_name == "Random Forest":
+                model = RandomForestClassifier(**params)
+            elif model_name == "Gradient Boosting":
+                model = GradientBoostingClassifier(**params)
+            elif model_name == "SVM":
+                model = SVC(**params, probability=True)
+            elif model_name == "KNN":
+                model = KNeighborsClassifier(**params)
+
+            model.fit(X_train_transformed, y_train_encoded)
+            y_pred = model.predict(X_test_transformed)
+
+            accuracy = accuracy_score(y_test_encoded, y_pred)
+            best_metrics[model_name] = {
+                "Accuracy": accuracy,
+                "Precision": precision_score(y_test_encoded, y_pred, average='weighted'),
+                "Recall": recall_score(y_test_encoded, y_pred, average='weighted'),
+                "F1 Score": f1_score(y_test_encoded, y_pred, average='weighted')
+            }
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_model = model
+                best_model_name = model_name
+                model_param = params
+
+        return JSONResponse(content={
+            "best_metrics": best_metrics,
+            "best_model_name": best_model_name,
+            "param": model_param
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to retrain models: {e}")
